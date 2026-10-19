@@ -5,8 +5,8 @@
 #   Part 2: Monte Carlo Experiment A (global cost-time cloud)
 #   Part 3: Monte Carlo Experiment B (exceedance curves, common scenarios, Big-M check)
 # All CSV files and figures are saved in the folder results/ (listed at the end of the run).
-# Data and model logic are taken from MOO-Definitive.ipynb; a random seed is added and
-# two rates that increased with volume are corrected (Binder 506 -> 486, PBF 922 -> 906).
+# Data and model logic are taken from MOO-Definitive.ipynb; a random seed is added, and the
+# Model 1 discount rates follow one explicit rule for every technology (see section 1).
 # Every number used in the paper is printed, and figures/CSVs are saved.
 # =====================================================================
 import math
@@ -18,7 +18,7 @@ from gurobipy import GRB
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mt
 import matplotlib.patches as mpatches
-
+ 
 # ---------------------------------------------------------------------
 # 0) SETTINGS
 # ---------------------------------------------------------------------
@@ -26,14 +26,14 @@ SEED = 42                     # fixes all random draws -> reproducible results
 RUN_DETERMINISTIC = True
 RUN_EXPERIMENT_A = True
 RUN_EXPERIMENT_B = True
-
+ 
 N_SIM_A = 100_000             # Experiment A scenarios (original notebook value)
 N_SCEN_B = 5_000              # Experiment B scenarios
 EPS_B = [1000, 1500, 2000, 2500, 3000, 3500, 4000, 5000, 6000]
 CAST_CAP_B = 260              # casting hours per line (same as the deterministic runs)
 BIG_M_PENALTY = 1e8           # USD per excess hour in the Big-M check (10e7 in the notebook)
 SHOW_TITLES = True            # titles on every plot (set False for journal figures, which use captions)
-
+ 
 OUT_DIR = Path('results')     # every CSV and PNG is saved here
 OUT_DIR.mkdir(exist_ok=True)
 saved_files = []
@@ -43,12 +43,12 @@ def save_fig(fig, name):
 def save_csv(df, name, index=False):
     path = OUT_DIR / name
     df.to_csv(path, index=index); saved_files.append(path)
-
+ 
 plt.rcParams.update({'font.size': 16, 'axes.titlesize': 17, 'axes.labelsize': 17,
                      'xtick.labelsize': 15, 'ytick.labelsize': 15, 'legend.fontsize': 14})
 fmt_h = mt.FuncFormatter(lambda x, _: f"{int(x):,}")
 fmt_m = mt.FuncFormatter(lambda y, _: f"{y/1e6:.1f}M")
-
+ 
 # ---------------------------------------------------------------------
 # 1) BASE DATA (identical to the notebook)
 # ---------------------------------------------------------------------
@@ -56,7 +56,7 @@ machines    = ['AM_hWAAM', 'AM_Binder', 'AM_slm', 'AM_PBF', 'TM_Casting']
 am_machines = ['AM_hWAAM', 'AM_Binder', 'AM_slm', 'AM_PBF']
 tm_machines = ['TM_Casting']
 parts       = ['part_1', 'part_2']        # part_1 = original, part_2 = topology-optimized
-
+ 
 batch_size = {
     ('AM_hWAAM','part_1'):6, ('AM_hWAAM','part_2'):6,
     ('AM_Binder','part_1'):8, ('AM_Binder','part_2'):8,
@@ -78,35 +78,50 @@ cap_hours  = {'AM_hWAAM':440, 'AM_Binder':460, 'AM_slm':460,
 setup_time = {'AM_hWAAM':12, 'AM_Binder':10, 'AM_slm':15, 'AM_PBF':20, 'TM_Casting':50}
 lead_time  = {'AM_hWAAM':2*24, 'AM_Binder':2*24, 'AM_slm':3*24, 'AM_PBF':3*24,
               'TM_Casting':21*24}
-
+ 
 # Model 1: incremental discounts (marginal rate per segment)
+# Rule (same for every technology):
+#   segment 1      : list price L
+#   segment 2      : c2 = 0.95 * L                       (5% first discount)
+#   AM, seg 3..8   : c2 * (38, 37, 36, 35, 34, 33) / 40  (about -2.4% of L per segment)
+#   TM, seg 3..8   : c2 * (40, 30, 25, 20, 15, 10) / 60  (tooling amortization)
+# Rates are rounded to the nearest dollar (half up).
 pwl_breakpoints = [0, 25, 50, 100, 200, 400, 800, 1200, 2200]
-incr_rates = {
-    'AM_hWAAM':   [1000, 950, 903, 879, 855, 831, 808, 784],
-    'AM_Binder':  [626, 594, 566, 526, 522, 508, 496, 486],   # last rate corrected (was 506)
-    'AM_slm':     [790, 750, 710, 693, 659, 640, 623, 603],
-    'AM_PBF':     [960, 912, 906, 902, 814, 796, 774, 756],   # third rate corrected (was 922)
-    'TM_Casting': [2500, 2375, 1583, 1188, 991, 792, 595, 396],
-}
+list_price = {'AM_hWAAM': 1000, 'AM_Binder': 626, 'AM_slm': 790, 'AM_PBF': 960, 'TM_Casting': 2500}
+AM_FRACTIONS = [38/40, 37/40, 36/40, 35/40, 34/40, 33/40]
+TM_FRACTIONS = [40/60, 30/60, 25/60, 20/60, 15/60, 10/60]
+def round_half_up(v):
+    return int(math.floor(v + 0.5))
+def discount_schedule(L, fractions):
+    c2 = 0.95 * L
+    return [L, round_half_up(c2)] + [round_half_up(c2 * f) for f in fractions]
+incr_rates = {m: discount_schedule(list_price[m], TM_FRACTIONS if m in tm_machines else AM_FRACTIONS)
+              for m in machines}
+# resulting rates (USD per part):
+#   AM_hWAAM   [1000, 950, 903, 879, 855, 831, 808, 784]
+#   AM_Binder  [ 626, 595, 565, 550, 535, 520, 505, 491]
+#   AM_slm     [ 790, 751, 713, 694, 675, 657, 638, 619]
+#   AM_PBF     [ 960, 912, 866, 844, 821, 798, 775, 752]
+#   TM_Casting [2500,2375,1583,1188, 990, 792, 594, 396]
 def cumulative(rates, bps=pwl_breakpoints):
     cum = [0.0]
     for k, r in enumerate(rates):
         cum.append(cum[-1] + (bps[k+1] - bps[k]) * r)
     return cum
 pwl_costvals = {m: cumulative(incr_rates[m]) for m in machines}
-
+ 
 # Model 2: all-units (bulk) discount brackets
 bounds_bulk = {1:(0,25), 2:(25,50), 3:(50,100), 4:(100,200),
                5:(200,400), 6:(400,800), 7:(800,1400), 8:(1400,2200)}
 rate_bulk_AM = {1:1000, 2:950, 3:903, 4:879, 5:855, 6:831, 7:808, 8:786}
 rate_bulk_TM = {1:2500, 2:2375, 3:1583, 4:1188, 5:938, 6:792, 7:625, 8:417}
-
+ 
 B_DET = 1e8                   # deterministic budget (non-binding)
 B_MC  = 1e7                   # Monte Carlo budget
 demand_values = [10, 30, 55, 80, 110, 160, 250, 300, 450, 600, 700,
                  900, 1000, 1200, 1500, 1700, 1800, 1900, 2100]
 eps_values = list(range(300, 10000, 300))   # 300 ... 9,900 h
-
+ 
 # ---------------------------------------------------------------------
 # 2) DETERMINISTIC MODEL (Model 1 or Model 2, with/without lead time)
 # ---------------------------------------------------------------------
@@ -118,17 +133,17 @@ def solve_det(demand, eps, model='M1', lead=False, setup_mult_am=1.0):
     y   = md.addVars(machines, vtype=GRB.BINARY)
     vol = md.addVars(machines, lb=0)
     vc  = md.addVars(machines, lb=0)
-
+ 
     T = gp.quicksum(x[i,j]*batch_size[i,j]*base_time[i,j] for i in machines for j in parts)
     if lead:
         T += gp.quicksum(y[i]*lead_time[i] + n[i]*setup_time[i] for i in machines)
     C = gp.quicksum(setup[i]*n[i] + vc[i] for i in machines)
-
+ 
     md.setObjective(C, GRB.MINIMIZE)
     md.addConstr(C <= B_DET)
     md.addConstr(T <= eps)
     md.addConstr(gp.quicksum(x[i,j]*batch_size[i,j] for i in machines for j in parts) >= demand)
-
+ 
     bigM = 1e6 if model == 'M1' else 1e8
     for i in machines:
         md.addConstr(vol[i] == gp.quicksum(x[i,j]*batch_size[i,j] for j in parts))
@@ -156,7 +171,7 @@ def solve_det(demand, eps, model='M1', lead=False, setup_mult_am=1.0):
             'vol_AM': vA, 'vol_TM': vT,
             'n_AM': sum(n[i].X for i in am_machines), 'n_TM': sum(n[i].X for i in tm_machines),
             'Tech': 'AM Dominant' if vA > vT else 'TM Dominant'}
-
+ 
 def pareto_filter(df):
     keep = []
     for D, g in df.groupby('Demand'):
@@ -165,7 +180,7 @@ def pareto_filter(df):
         dom = [np.any((c <= c[k]) & (t <= t[k]) & ((c < c[k]) | (t < t[k]))) for k in range(len(g))]
         keep.append(g[~np.array(dom)])
     return pd.concat(keep, ignore_index=True)
-
+ 
 def plot_pareto(df_p, fname, title):
     col = {'AM Dominant': 'orange', 'TM Dominant': 'blue'}
     fig, ax = plt.subplots(figsize=(10, 6))
@@ -183,7 +198,7 @@ def plot_pareto(df_p, fname, title):
     ax.xaxis.set_major_formatter(fmt_h); ax.yaxis.set_major_formatter(fmt_m); ax.grid(True)
     if SHOW_TITLES: ax.set_title(title)
     plt.tight_layout(); save_fig(fig, fname); plt.show()
-
+ 
 if RUN_DETERMINISTIC:
     case_titles = {
         'M1 noLT':  'Pareto frontiers: Model 1 (incremental), no lead time',
@@ -211,7 +226,7 @@ if RUN_DETERMINISTIC:
         save_csv(df,   f"det_{name.replace(' ', '_')}_all.csv")
         save_csv(df_p, f"det_{name.replace(' ', '_')}_pareto.csv")
         plot_pareto(df_p, fname, case_titles[name])
-
+ 
     # --- summary per case: cheapest vs fastest Pareto point ---
     summ = {}
     for name, df_p in frontier.items():
@@ -229,31 +244,31 @@ if RUN_DETERMINISTIC:
         print(f"\n===== {name}: cheapest vs fastest Pareto point =====")
         print(summ[name].round(2).to_string())
         save_csv(summ[name], f"det_{name.replace(' ', '_')}_summary.csv", index=True)
-
+ 
     print("\n===== 30% AM setup-cost reduction (cheapest plan) =====")
     for base, red in [('M1 LT', 'M1 LT-30'), ('M2 LT', 'M2 LT-30')]:
         for D in [450, 600, 700, 900, 1000, 1200]:
             a, b = summ[base].loc[D, 'C_cheap'], summ[red].loc[D, 'C_cheap']
             print(f"{base:6s} D={D:5d}: {a/1e6:.2f}M -> {b/1e6:.2f}M  ({100*(b/a-1):+.1f}%)")
-
+ 
     print("\n===== Model 2 vs Model 1 (cheapest plan) =====")
     for lt in ['noLT', 'LT']:
         for D in [250, 600, 1000, 1200, 1500]:
             a, b = summ[f'M1 {lt}'].loc[D, 'C_cheap'], summ[f'M2 {lt}'].loc[D, 'C_cheap']
             print(f"{lt:5s} D={D:5d}: M1 {a/1e6:.2f}M  M2 {b/1e6:.2f}M  ({100*(b/a-1):+.1f}%)")
-
+ 
     print("\n===== Machine counts (mean over feasible eps, rounded up) =====")
     mtab = pd.concat({k: v for k, v in machines_tab.items()}, axis=1)
     print(mtab.to_string())
     save_csv(mtab, 'det_machine_counts.csv', index=True)
-
+ 
 # ---------------------------------------------------------------------
 # 3) MONTE CARLO HELPERS
 # ---------------------------------------------------------------------
 rng = np.random.default_rng(SEED)
 def trunc_normal(mu, sigma, low):
     return max(rng.normal(mu, sigma), low)
-
+ 
 def solve_mc(D, eps, setup, times, costvals, caps, budget, slack_penalty=None):
     md = gp.Model(); md.Params.OutputFlag = 0
     x   = md.addVars(machines, parts, vtype=GRB.INTEGER, lb=0)
@@ -283,7 +298,7 @@ def solve_mc(D, eps, setup, times, costvals, caps, budget, slack_penalty=None):
     if s is not None:
         out['TimeSlack'] = s.X; out['CostWithPenalty'] = C.getValue() + slack_penalty*s.X
     return out
-
+ 
 def exceedance_plots(df, title, fname_prefix, logscale=False, cost_col='Cost'):
     p_levels = [0.05, 0.10, 0.15, 0.25, 0.50, 0.75, 0.90, 0.95]
     fig, ax = plt.subplots(figsize=(10, 6))
@@ -297,7 +312,7 @@ def exceedance_plots(df, title, fname_prefix, logscale=False, cost_col='Cost'):
     ax.grid(True); ax.legend(title='Time Budget')
     if logscale: ax.set_xscale('log')
     plt.tight_layout(); save_fig(fig, f"{fname_prefix}_exceedance.png"); plt.show()
-
+ 
     fig, ax = plt.subplots(figsize=(10, 6))
     eps_sorted = sorted(df['Epsilon'].unique())
     for p in p_levels:
@@ -308,7 +323,7 @@ def exceedance_plots(df, title, fname_prefix, logscale=False, cost_col='Cost'):
     ax.grid(True); ax.legend(title='Exceedance Level')
     if logscale: ax.set_yscale('log')
     plt.tight_layout(); save_fig(fig, f"{fname_prefix}_thresholds.png"); plt.show()
-
+ 
 def print_quantiles(df, label, csv_name, cost_col='Cost'):
     print(f"\n===== Quantiles: {label} =====")
     rows = []
@@ -318,7 +333,7 @@ def print_quantiles(df, label, csv_name, cost_col='Cost'):
         rows.append({'Epsilon': eps, 'n': len(c), 'median': med, 'P95': p95, 'P95_over_median': p95/med})
         print(f"eps={eps:5d}  n={len(c):5d}  median={med:,.0f}  P95={p95:,.0f}  P95/median={p95/med:.2f}")
     save_csv(pd.DataFrame(rows), csv_name)
-
+ 
 # ---------------------------------------------------------------------
 # 4) EXPERIMENT A: global cost-time cloud
 #    eps ~ U(300, 10000); one flat sampled unit rate per technology (no discounts)
@@ -348,7 +363,7 @@ if RUN_EXPERIMENT_A:
     ax.xaxis.set_major_formatter(fmt_h); ax.yaxis.set_major_formatter(fmt_m)
     if SHOW_TITLES: ax.set_title('Monte Carlo Experiment A: cost vs. time (feasible scenarios)')
     plt.tight_layout(); save_fig(fig, 'general_montecarlo.png'); plt.show()
-
+ 
 # ---------------------------------------------------------------------
 # 5) EXPERIMENT B: fixed time budgets with common random numbers
 #    The same scenarios are used for the hard-constraint and Big-M runs.
@@ -375,7 +390,7 @@ if RUN_EXPERIMENT_B:
     df_raw  = pd.DataFrame(recs_hard); save_csv(df_raw, 'mc_experiment_B_hard.csv')
     df_soft = pd.DataFrame(recs_soft); save_csv(df_soft, 'mc_experiment_B_bigM.csv')
     df_crn  = df_raw[df_raw['Status'] == 'OPTIMAL'].copy()
-
+ 
     n_tot, n_ok = len(df_raw), len(df_crn)
     print(f"\n===== Experiment B feasibility =====")
     print(f"Runs: {n_tot:,}   optimal: {n_ok:,} ({100*n_ok/n_tot:.1f}%)   infeasible: {n_tot-n_ok:,} ({100*(n_tot-n_ok)/n_tot:.1f}%)")
@@ -383,11 +398,11 @@ if RUN_EXPERIMENT_B:
           .rename('% feasible').to_string())
     print("\nAverage casting share of parts by eps:")
     print(df_crn.groupby('Epsilon')['Casting_share'].mean().mul(100).round(1).to_string())
-
+ 
     # pooled (feasible at each budget)
     print_quantiles(df_crn, 'pooled, feasible runs at each budget', 'mc_B_quantiles_pooled.csv')
     exceedance_plots(df_crn, '(feasible runs)', 'exc_pooled')
-
+ 
     # common scenarios (feasible at every budget)
     ok = df_crn.groupby('scenario')['Epsilon'].nunique()
     common_ids = ok[ok == len(EPS_B)].index
@@ -395,7 +410,7 @@ if RUN_EXPERIMENT_B:
     print(f"\nCommon scenarios: {len(common_ids):,} of {df_crn['scenario'].nunique():,} scenarios feasible at least once")
     print_quantiles(df_common, 'common scenarios (feasible for all eps)', 'mc_B_quantiles_common.csv')
     exceedance_plots(df_common, '(scenarios feasible for all ε)', 'exc_common')
-
+ 
     # Big-M check (all scenarios, penalized cost)
     df_soft_ok = df_soft[df_soft['Status'] == 'OPTIMAL'].copy()
     print(f"\nBig-M runs solved: {len(df_soft_ok):,} of {len(df_soft):,}")
@@ -403,7 +418,7 @@ if RUN_EXPERIMENT_B:
           .rename('% runs using slack').to_string())
     print_quantiles(df_soft_ok, 'Big-M, penalized cost', 'mc_B_quantiles_bigM.csv', cost_col='CostWithPenalty')
     exceedance_plots(df_soft_ok, '(Big-M penalty, log scale)', 'exc_bigM', logscale=True, cost_col='CostWithPenalty')
-
+ 
     # scatter: feasible runs only (no slack)
     fig, ax = plt.subplots(figsize=(10, 6))
     ax.scatter(df_crn['Epsilon'], df_crn['Cost'], c='steelblue', alpha=0.3, s=20, edgecolor='none')
@@ -411,7 +426,7 @@ if RUN_EXPERIMENT_B:
     ax.xaxis.set_major_formatter(fmt_h); ax.yaxis.set_major_formatter(fmt_m)
     if SHOW_TITLES: ax.set_title('Feasible runs only (no slack)')
     plt.tight_layout(); save_fig(fig, 'feasibles.png'); plt.show()
-
+ 
     # scatter: all runs with Big-M penalty
     fig, ax = plt.subplots(figsize=(10, 6))
     used = df_soft_ok['TimeSlack'] > 0
@@ -423,7 +438,7 @@ if RUN_EXPERIMENT_B:
     ax.legend(); ax.grid(True); ax.xaxis.set_major_formatter(fmt_h)
     if SHOW_TITLES: ax.set_title('All runs with Big-M penalty (log scale)')
     plt.tight_layout(); save_fig(fig, 'bigM_scatter.png'); plt.show()
-
+ 
 print(f"\nDone. {len(saved_files)} files saved in: {OUT_DIR.resolve()}")
 for f in saved_files:
     print("  ", f.name)
